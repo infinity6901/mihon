@@ -352,6 +352,18 @@ class ReaderActivity : BaseActivity() {
     }
 
     /**
+     * finish() isn't called when the reader is swiped away from recents or the system destroys it,
+     * so chapters queued for deletion would stay on disk. Flush them whenever the reader leaves the
+     * screen, except for a rotation/config change where the reader comes straight back.
+     */
+    override fun onStop() {
+        if (!isChangingConfigurations) {
+            viewModel.onActivityFinish()
+        }
+        super.onStop()
+    }
+
+    /**
      * Set menu visibility again on activity resume to apply immersive mode again if needed.
      * Helps with rotations.
      */

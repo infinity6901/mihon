@@ -853,6 +853,23 @@
 
     <!-- Reader activity -->
     <string name="custom_filter">Custom filter</string>
+    <string name="pref_category_colorizer">Colorizer</string>
+    <string name="pref_colorizer_enabled">Process pages with colorizer server</string>
+    <string name="pref_colorizer_hint">Pages are sent to your own colorizer server. Changes apply to pages opened afterwards. The server must be reachable from this device.</string>
+    <string name="pref_colorizer_server_url">Server URL</string>
+    <string name="pref_colorizer_test_connection">Test connection</string>
+    <string name="pref_colorizer_connected">Connected</string>
+    <string name="pref_colorizer_colorize">Colorize</string>
+    <string name="pref_colorizer_upscale">Upscale</string>
+    <string name="pref_colorizer_denoise">Denoise</string>
+    <string name="pref_colorizer_upscale_factor">Upscale factor</string>
+    <string name="pref_colorizer_denoise_sigma">Denoise strength</string>
+    <string name="pref_colorizer_device">Device</string>
+    <string name="pref_colorizer_compare">Before/after slider (paged modes only)</string>
+    <string name="colorizer_before">Before</string>
+    <string name="colorizer_after">After</string>
+    <string name="colorizer_no_server">Colorizer: set the server URL in the reader settings</string>
+    <string name="colorizer_error">Colorizer: %1$s</string>
     <string name="set_as_cover">Set as cover</string>
     <string name="cover_updated">Cover updated</string>
     <string name="share_page_info">%1$s: %2$s, page %3$d</string>

@@ -2,13 +2,19 @@ package eu.kanade.tachiyomi.ui.reader.viewer.pager
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.view.LayoutInflater
+import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+import android.widget.FrameLayout
 import androidx.core.view.isVisible
 import eu.kanade.presentation.util.formattedMessage
 import eu.kanade.tachiyomi.databinding.ReaderErrorBinding
 import eu.kanade.tachiyomi.source.model.Page
+import eu.kanade.tachiyomi.ui.reader.colorizer.PageColorizer
 import eu.kanade.tachiyomi.ui.reader.model.InsertPage
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
+import eu.kanade.tachiyomi.ui.reader.viewer.CompareSliderView
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderPageImageView
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
 import eu.kanade.tachiyomi.ui.webview.WebViewActivity
@@ -21,6 +27,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import logcat.LogPriority
+import mihon.app.di.appGraph
 import okio.Buffer
 import okio.BufferedSource
 import tachiyomi.core.common.i18n.stringResource
@@ -73,6 +80,7 @@ class PagerPageHolder(
         super.onDetachedFromWindow()
         loadJob?.cancel()
         loadJob = null
+        compareView?.release()
     }
 
     private fun initProgressIndicator() {
@@ -149,7 +157,30 @@ class PagerPageHolder(
         val streamFn = page.stream ?: return
 
         try {
-            val buffer = withContext(Dispatchers.IO) { streamFn().use { Buffer().readFrom(it) } }
+            val readerPreferences = context.applicationContext.appGraph.readerPreferences
+            if (readerPreferences.colorizerEnabled.get()) {
+                // Processing on the server can take a while, keep the spinner up
+                initProgressIndicator()
+                progressIndicator?.show()
+            }
+            // The before/after slider doesn't work together with splitting or rotating double pages
+            val wantCompare = readerPreferences.colorizerCompare.get() &&
+                page !is InsertPage &&
+                !viewer.config.dualPageSplit &&
+                !viewer.config.dualPageRotateToFit
+            val loaded = PageColorizer.load(context, readerPreferences, streamFn, keepOriginal = wantCompare)
+
+            val original = loaded.original
+            if (original != null) {
+                val bitmaps = withContext(Dispatchers.Default) { decodeForCompare(original, loaded.buffer) }
+                if (bitmaps != null) {
+                    withContext(Dispatchers.Main) { showCompare(bitmaps.first, bitmaps.second) }
+                    return
+                }
+            }
+            if (compareView != null) withContext(Dispatchers.Main) { removeCompare() }
+
+            val buffer = loaded.buffer
             // Splitting, merging and sampling the background decode the image, which is CPU work
             val (source, isAnimated, background) = withContext(Dispatchers.Default) {
                 val source = process(item, buffer)
@@ -184,6 +215,53 @@ class PagerPageHolder(
                 setError(e)
             }
         }
+    }
+
+    private var compareView: CompareSliderView? = null
+
+    private fun showCompare(before: Bitmap, after: Bitmap) {
+        val view = compareView ?: CompareSliderView(
+            context,
+            context.stringResource(MR.strings.colorizer_before),
+            context.stringResource(MR.strings.colorizer_after),
+        ).also {
+            compareView = it
+            addView(it, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        }
+        view.setBitmaps(before, after)
+        removeErrorLayout()
+        onImageLoaded()
+    }
+
+    private fun removeCompare() {
+        compareView?.let {
+            it.release()
+            removeView(it)
+        }
+        compareView = null
+    }
+
+    /**
+     * Decodes the original and processed page for the before/after slider, scaled down so they fit in memory.
+     * Returns null if either can't be decoded, in which case the page is shown normally.
+     */
+    private fun decodeForCompare(original: ByteArray, processed: Buffer): Pair<Bitmap, Bitmap>? {
+        val metrics = context.resources.displayMetrics
+        val maxSide = maxOf(metrics.widthPixels, metrics.heightPixels) * 2
+        val before = decodeSampled(maxSide) { BitmapFactory.decodeByteArray(original, 0, original.size, it) }
+            ?: return null
+        val after = decodeSampled(maxSide) { BitmapFactory.decodeStream(processed.peek().inputStream(), null, it) }
+            ?: return null
+        return before to after
+    }
+
+    private fun decodeSampled(maxSide: Int, decode: (BitmapFactory.Options) -> Bitmap?): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        decode(bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > maxSide) sample *= 2
+        return decode(BitmapFactory.Options().apply { inSampleSize = sample })
     }
 
     private fun process(page: ReaderPage, imageSource: BufferedSource): BufferedSource {
@@ -247,6 +325,7 @@ class PagerPageHolder(
      * Called when the page has an error.
      */
     private fun setError(error: Throwable?) {
+        removeCompare()
         progressIndicator?.hide()
         showErrorLayout(error)
     }

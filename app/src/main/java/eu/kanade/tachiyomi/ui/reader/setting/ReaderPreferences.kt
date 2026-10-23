@@ -56,6 +56,28 @@ class ReaderPreferences(
 
     val showReadingMode: Preference<Boolean> = preferenceStore.getBoolean("pref_show_reading_mode", true)
 
+    // region Colorizer
+
+    val colorizerEnabled: Preference<Boolean> = preferenceStore.getBoolean("colorizer_enabled", false)
+
+    val colorizerServerUrl: Preference<String> = preferenceStore.getString("colorizer_server_url", "")
+
+    val colorizerColorize: Preference<Boolean> = preferenceStore.getBoolean("colorizer_colorize", true)
+
+    val colorizerUpscale: Preference<Boolean> = preferenceStore.getBoolean("colorizer_upscale", true)
+
+    val colorizerDenoise: Preference<Boolean> = preferenceStore.getBoolean("colorizer_denoise", true)
+
+    val colorizerUpscaleFactor: Preference<Int> = preferenceStore.getInt("colorizer_upscale_factor", 2)
+
+    val colorizerDenoiseSigma: Preference<Int> = preferenceStore.getInt("colorizer_denoise_sigma", 25)
+
+    val colorizerDevice: Preference<String> = preferenceStore.getString("colorizer_device", "auto")
+
+    val colorizerCompare: Preference<Boolean> = preferenceStore.getBoolean("colorizer_compare", false)
+
+    // endregion
+
     val fullscreen: Preference<Boolean> = preferenceStore.getBoolean("fullscreen", true)
 
     val drawUnderCutout: Preference<Boolean> = preferenceStore.getBoolean("cutout_short", true)

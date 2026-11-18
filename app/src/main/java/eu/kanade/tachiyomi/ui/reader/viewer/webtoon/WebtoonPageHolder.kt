@@ -9,6 +9,7 @@ import androidx.core.view.updateLayoutParams
 import androidx.core.view.updateMargins
 import com.davemorrissey.labs.subscaleview.SubsamplingScaleImageView
 import eu.kanade.tachiyomi.source.model.Page
+import eu.kanade.tachiyomi.ui.reader.colorizer.PageColorizer
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderPageErrorView
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderPageImageView
@@ -23,7 +24,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import logcat.LogPriority
-import okio.Buffer
+import mihon.app.di.appGraph
 import tachiyomi.core.common.util.system.ImageUtil
 import tachiyomi.core.common.util.system.logcat
 
@@ -183,7 +184,8 @@ class WebtoonPageHolder(
         val streamFn = page?.stream ?: return
 
         try {
-            val buffer = withContext(Dispatchers.IO) { streamFn().use { Buffer().readFrom(it) } }
+            val readerPreferences = frame.context.applicationContext.appGraph.readerPreferences
+            val buffer = PageColorizer.load(frame.context, readerPreferences, streamFn, keepOriginal = false).buffer
             // Splitting and merging decode the image, which is CPU work
             val (source, isAnimated) = withContext(Dispatchers.Default) {
                 val source = viewer.simpleLongStrip.page.processStripImage(buffer)

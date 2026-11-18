@@ -28,6 +28,7 @@ import eu.kanade.presentation.components.NavigatorAdaptiveSheet
 import eu.kanade.presentation.manga.ChapterSettingsDialog
 import eu.kanade.presentation.manga.DuplicateMangaDialog
 import eu.kanade.presentation.manga.EditCoverAction
+import eu.kanade.presentation.components.NfcMangaModeDialog
 import eu.kanade.presentation.manga.MangaScreen
 import eu.kanade.presentation.manga.components.DeleteChaptersDialog
 import eu.kanade.presentation.manga.components.MangaCoverDialog
@@ -90,6 +91,7 @@ class MangaScreen(
         }
 
         val successState = state as MangaViewModel.State.Success
+        var showNfcDialog by remember { mutableStateOf(false) }
         val isHttpSource = remember { successState.source is HttpSource }
 
         LaunchedEffect(successState.manga, viewModel.source) {
@@ -160,6 +162,7 @@ class MangaScreen(
                 navigator.push(MigrationConfigScreen(successState.manga.id))
             }.takeIf { successState.manga.favorite },
             onEditNotesClicked = { navigator.push(MangaNotesScreen(manga = successState.manga)) },
+            onWriteNfcClicked = { showNfcDialog = true },
             onMultiBookmarkClicked = viewModel::bookmarkChapters,
             onMultiMarkAsReadClicked = viewModel::markChaptersRead,
             onMarkPreviousAsReadClicked = viewModel::markPreviousChapterRead,
@@ -171,6 +174,14 @@ class MangaScreen(
         )
 
         var showScanlatorsDialog by remember { mutableStateOf(false) }
+
+        if (showNfcDialog) {
+            NfcMangaModeDialog(
+                mangaId = successState.manga.id,
+                mangaTitle = successState.manga.title,
+                onDismissRequest = { showNfcDialog = false },
+            )
+        }
 
         val onDismissRequest = { viewModel.dismissDialog() }
         when (val dialog = successState.dialog) {

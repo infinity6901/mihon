@@ -34,6 +34,7 @@ import eu.kanade.presentation.util.LocalBackPress
 import eu.kanade.presentation.util.Screen
 import mihon.icons.materialsymbols.MaterialSymbols
 import mihon.icons.materialsymbols.automirroredrounded.ChromeReaderMode
+import mihon.icons.materialsymbols.rounded.BookmarkAdd
 import mihon.icons.materialsymbols.rounded.Code
 import mihon.icons.materialsymbols.rounded.CollectionsBookmark
 import mihon.icons.materialsymbols.rounded.Download
@@ -218,6 +219,12 @@ object SettingsMainScreen : Screen() {
             subtitleRes = MR.strings.pref_security_summary,
             icon = MaterialSymbols.Rounded.Security,
             screen = SettingsSecurityScreen,
+        ),
+        Item(
+            titleRes = MR.strings.pref_category_nfc,
+            subtitleRes = MR.strings.pref_nfc_summary,
+            icon = MaterialSymbols.Rounded.BookmarkAdd,
+            screen = SettingsNfcScreen,
         ),
         Item(
             titleRes = MR.strings.pref_category_advanced,

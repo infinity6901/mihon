@@ -26,6 +26,8 @@ class SecurityPreferences(
 
     val hideNotificationContent: Preference<Boolean> = preferenceStore.getBoolean("hide_notification_content", false)
 
+    val nfcUnlockTagHash: Preference<String> = preferenceStore.getString("nfc_unlock_tag_hash", "")
+
     /**
      * For app lock. Will be set when there is a pending timed lock.
      * Otherwise, this pref should be deleted.

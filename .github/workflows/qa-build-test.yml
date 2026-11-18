@@ -1,0 +1,599 @@
+name: QA - Build, Test & Release
+
+# Multi-stage QA pipeline for Mihon (with custom Colorizer + NFC tag features):
+#
+#   verify         Stage 1 / Gate 1 : dependencies, Kotlin+Java compile, resources, manifest (incl. NFC),
+#                                     debug APK + verify, unit tests, SQLDelight migration check, Android Lint,
+#                                     compiler/deprecation warnings, static-review hints
+#   build-release  FOSS release variant (R8 minify + shrink, no telemetry) + signature check
+#   device-tests   Stage 2 (emulator): install + cold launch, mihon://nfc/* deep-link smoke tests,
+#                                     background/foreground, rotation, lock/unlock, process restart,
+#                                     crash/ANR detection, logcat + screenshot capture
+#   report         QA report (PASS / FAIL / NOT RUN) + failure report (posted to job summary + uploaded)
+#   release        Optional: GitHub Release with APKs + qa-report.md (workflow_dispatch -> publish_release)
+#
+# Artifacts (each uploaded separately, even when a job fails):
+#   unit-test-reports | lint-reports | build-logs | mihon-debug-apk-<ver> | mihon-release-apk-<ver> |
+#   release-build-logs | instrumented-test-reports | device-test-logs | device-logcat | qa-report | failure-report
+#
+# Signing (optional for CI, REQUIRED for publishing): repo secrets SIGNING_KEY (or SIGN_KEY) (base64 keystore),
+# ALIAS, KEY_PASSWORD, KEY_STORE_PASSWORD.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_release:
+        description: 'Also build the FOSS release (R8) APK'
+        type: boolean
+        default: true
+      run_device_tests:
+        description: 'Run the emulator tests (NFC deep-link + lifecycle checks)'
+        type: boolean
+        default: true
+      lifecycle_cycles:
+        description: 'Repeat count for the emulator background/rotate/lock cycles'
+        type: number
+        default: 5
+      strict_lint:
+        description: 'Fail the run when Android Lint reports errors'
+        type: boolean
+        default: false
+      publish_release:
+        description: 'Publish a GitHub Release with the APKs (needs signing secrets)'
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Release tag (empty = mihon-custom-v<versionName>-<short sha>)'
+        type: string
+        default: ''
+      prerelease:
+        description: 'Mark the release as a pre-release (recommended: physical NFC & colorizer need on-device testing)'
+        type: boolean
+        default: true
+  push:
+    branches: [ 'custom', 'main', 'master' ]
+  pull_request:
+    branches: [ 'main', 'master', 'custom' ]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: qa-build-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------------------------------------
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version_name: ${{ steps.plan.outputs.version_name }}
+      build_release: ${{ steps.plan.outputs.build_release }}
+      run_device: ${{ steps.plan.outputs.run_device }}
+      cycles: ${{ steps.plan.outputs.cycles }}
+      strict_lint: ${{ steps.plan.outputs.strict_lint }}
+      publish: ${{ steps.plan.outputs.publish }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide what to run
+        id: plan
+        env:
+          IN_BUILD_RELEASE: ${{ inputs.build_release }}
+          IN_RUN_DEVICE: ${{ inputs.run_device_tests }}
+          IN_CYCLES: ${{ inputs.lifecycle_cycles }}
+          IN_STRICT_LINT: ${{ inputs.strict_lint }}
+          IN_PUBLISH: ${{ inputs.publish_release }}
+          IN_TAG: ${{ inputs.release_tag }}
+          IN_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          BUILD_RELEASE="${IN_BUILD_RELEASE:-true}"
+          RUN_DEVICE="${IN_RUN_DEVICE:-true}"
+          CYCLES="${IN_CYCLES:-5}"
+          STRICT="${IN_STRICT_LINT:-false}"
+          PUBLISH="${IN_PUBLISH:-false}"
+          PRERELEASE="${IN_PRERELEASE:-true}"
+          [ "$PUBLISH" = "true" ] && BUILD_RELEASE=true
+
+          VERSION_NAME=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          TAG="$IN_TAG"
+          [ -z "$TAG" ] && TAG="mihon-custom-v${VERSION_NAME}-$(echo "$GITHUB_SHA" | cut -c1-7)"
+
+          {
+            echo "version_name=$VERSION_NAME"
+            echo "build_release=$BUILD_RELEASE"
+            echo "run_device=$RUN_DEVICE"
+            echo "cycles=$CYCLES"
+            echo "strict_lint=$STRICT"
+            echo "publish=$PUBLISH"
+            echo "release_tag=$TAG"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Plan: version=$VERSION_NAME release=$BUILD_RELEASE device=$RUN_DEVICE strict_lint=$STRICT publish=$PUBLISH tag=$TAG"
+
+  # ------------------------------------------------------------------------------------------------
+  # Stage 1 / Gate 1
+  verify:
+    name: "Gate 1: build + unit tests + lint"
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      apk_built: ${{ steps.collect.outputs.apk_built }}
+    env:
+      VN: ${{ needs.plan.outputs.version_name }}
+      STRICT_LINT: ${{ needs.plan.outputs.strict_lint }}
+      GRADLE_ENCRYPTION_KEY: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-android-build
+
+      - name: Decode keystore (if secrets are available)
+        id: keystore
+        env:
+          SIGN_KEY: ${{ secrets.SIGNING_KEY || secrets.SIGN_KEY }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+        run: |
+          if [ -n "$SIGN_KEY" ] && [ -n "$ALIAS" ] && [ -n "$KEY_PASSWORD" ] && [ -n "$KEY_STORE_PASSWORD" ]; then
+            echo "$SIGN_KEY" | base64 -d > "${{ runner.temp }}/custom.keystore"
+            echo "MIHON_GITHUB_RELEASE=true" >> "$GITHUB_ENV"
+            echo "storeFile=${{ runner.temp }}/custom.keystore" >> "$GITHUB_ENV"
+          else
+            echo "No signing secrets - debug APK will use the default Android debug key."
+          fi
+
+      - name: Make scripts executable
+        run: chmod +x ./gradlew .github/scripts/*.sh
+
+      - name: "1.1 Dependency resolution"
+        env:
+          storePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyAlias: ${{ secrets.ALIAS }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+          CI_FAIL_IF_LOG_MATCHES: ' FAILED$'
+        run: |
+          source .github/scripts/ci-step.sh
+          ci_step dependencies "Dependency resolution (debugRuntimeClasspath)" \
+            ./gradlew :app:dependencies --configuration debugRuntimeClasspath
+
+      - name: "1.1 Kotlin + Java compilation"
+        env:
+          storePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyAlias: ${{ secrets.ALIAS }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          source .github/scripts/ci-step.sh
+          ci_step compile "Kotlin + Java compilation (all modules, debug)" \
+            ./gradlew :app:compileDebugKotlin :app:compileDebugJavaWithJavac \
+              --warning-mode all --no-build-cache --stacktrace
+          mkdir -p compiler-warnings
+          touch compiler-warnings/compiler-warnings.txt
+          grep -E '^w: ' ci-logs/compile.log | sort -u > compiler-warnings/compiler-warnings.txt || true
+          grep -iE 'deprecat' compiler-warnings/compiler-warnings.txt > compiler-warnings/deprecated-api-warnings.txt || true
+          grep -iE 'nfc|colorizer' compiler-warnings/compiler-warnings.txt > compiler-warnings/nfc-colorizer-warnings.txt || true
+          touch compiler-warnings/deprecated-api-warnings.txt compiler-warnings/nfc-colorizer-warnings.txt
+          echo "compiler warnings: $(wc -l < compiler-warnings/compiler-warnings.txt)," \
+               "deprecations: $(wc -l < compiler-warnings/deprecated-api-warnings.txt)," \
+               "nfc/colorizer: $(wc -l < compiler-warnings/nfc-colorizer-warnings.txt)"
+
+      - name: "1.1 Resource processing + manifest validation"
+        env:
+          storePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyAlias: ${{ secrets.ALIAS }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          source .github/scripts/ci-step.sh
+          ci_step resources "Resource processing (debug)" ./gradlew :app:processDebugResources --stacktrace
+          ci_step manifest "Manifest merge (debug)" ./gradlew :app:processDebugMainManifest --stacktrace
+
+          mkdir -p manifests
+          MM=$(find app/build -path '*merged_manifest*' -name AndroidManifest.xml | grep -i debug | head -n1)
+          REPORT=$(find app/build -name 'manifest-merger-*debug*-report.txt' | head -n1)
+          [ -n "$MM" ] && cp "$MM" manifests/AndroidManifest.merged.xml
+          [ -n "$REPORT" ] && cp "$REPORT" manifests/manifest-merger-report.txt
+          ci_step manifest-content "Merged manifest is well-formed and declares NFC permission + mihon://nfc filter" python3 - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          p = "manifests/AndroidManifest.merged.xml"
+          try:
+              root = ET.parse(p).getroot()
+          except (OSError, ET.ParseError) as e:
+              print("cannot parse merged manifest:", e); sys.exit(1)
+          ns = "{http://schemas.android.com/apk/res/android}"
+          perms = [u.get(ns + "name") for u in root.iter("uses-permission")]
+          if "android.permission.NFC" not in perms:
+              print("android.permission.NFC is missing from merged manifest"); sys.exit(1)
+          has_ndef = any(a.get(ns + "name") == "android.nfc.action.NDEF_DISCOVERED" for a in root.iter("action"))
+          has_nfc_host = any(d.get(ns + "host") == "nfc" for d in root.iter("data"))
+          if not (has_ndef and has_nfc_host):
+              print("MainActivity NDEF_DISCOVERED / host=nfc intent-filter is missing"); sys.exit(1)
+          print("Verified android.permission.NFC and mihon://nfc NDEF intent-filter.")
+          PY
+
+      - name: "1.1 Debug APK packaging"
+        env:
+          storePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyAlias: ${{ secrets.ALIAS }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          source .github/scripts/ci-step.sh
+          ci_step debug-apk "Assemble debug APK" ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Collect + verify debug APK
+        id: collect
+        run: |
+          source .github/scripts/ci-step.sh
+          mkdir -p out
+          APK=$(find app/build/outputs/apk/debug -name "*universal*.apk" | head -n1)
+          [ -n "$APK" ] || APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -n1)
+          if [ -n "$APK" ]; then
+            cp "$APK" "out/mihon-debug-$VN.apk"
+            echo "apk_built=true" >> "$GITHUB_OUTPUT"
+            ci_step apk-verify "Debug APK: package name, SDK/ABI info, valid signature" \
+              bash .github/scripts/verify-apk.sh "out/mihon-debug-$VN.apk"
+          else
+            echo "apk_built=false" >> "$GITHUB_OUTPUT"
+            ci_record apk-verify FAIL "Debug APK was not produced"
+          fi
+
+      - name: "1.2 Automated unit tests + SQLDelight migrations"
+        run: |
+          source .github/scripts/ci-step.sh
+          ci_step unit-tests "Unit tests (all modules)" \
+            ./gradlew testDebugUnitTest --continue --no-build-cache --stacktrace
+          ci_step sqldelight "Verify SQLDelight migrations" \
+            ./gradlew verifySqlDelightMigration --stacktrace
+
+      - name: "1.3 Android Lint"
+        run: |
+          source .github/scripts/ci-step.sh
+          ci_step lint "Android Lint (app + library modules)" \
+            ./gradlew :app:lintDebug lintDebug --continue --stacktrace
+
+      - name: "1.3 Static review hints (heuristic, informational)"
+        if: ${{ !cancelled() }}
+        run: bash .github/scripts/static-review.sh static-review
+
+      - name: Upload unit test reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            **/build/test-results/test*UnitTest/**
+            **/build/reports/tests/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload lint reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-reports
+          path: |
+            **/build/reports/lint-results*
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload build logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ci-logs/
+            ci-status/
+            compiler-warnings/
+            static-review/
+            manifests/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload debug APK
+        if: ${{ !cancelled() && steps.collect.outputs.apk_built == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihon-debug-apk-${{ needs.plan.outputs.version_name }}
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce Gate 1
+        if: ${{ !cancelled() }}
+        run: |
+          FAIL=0
+          ls ci-status/*.tsv > /dev/null 2>&1 || { echo "::error::No check results were recorded"; exit 1; }
+          for f in ci-status/*.tsv; do
+            IFS=$'\t' read -r id status rc desc < "$f"
+            [ "$status" = "FAIL" ] || continue
+            if [ "$id" = "lint" ] && [ "$STRICT_LINT" != "true" ]; then
+              echo "::warning title=Lint reported problems::$desc (not failing the run: strict_lint=false)"
+              continue
+            fi
+            echo "::error title=Gate 1 failed::$id - $desc"; FAIL=1
+          done
+          exit $FAIL
+
+  # ------------------------------------------------------------------------------------------------
+  build-release:
+    name: Release FOSS APK (R8)
+    needs: plan
+    if: needs.plan.outputs.build_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      VN: ${{ needs.plan.outputs.version_name }}
+      GRADLE_ENCRYPTION_KEY: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-android-build
+
+      - name: Check signing secrets
+        id: signing
+        env:
+          SIGN_KEY: ${{ secrets.SIGNING_KEY || secrets.SIGN_KEY }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          PUBLISH: ${{ needs.plan.outputs.publish }}
+        run: |
+          if [ -n "$SIGN_KEY" ] && [ -n "$ALIAS" ] && [ -n "$KEY_PASSWORD" ] && [ -n "$KEY_STORE_PASSWORD" ]; then
+            echo "$SIGN_KEY" | base64 -d > "${{ runner.temp }}/custom.keystore"
+            test -s "${{ runner.temp }}/custom.keystore"
+            echo "MIHON_GITHUB_RELEASE=true" >> "$GITHUB_ENV"
+            echo "storeFile=${{ runner.temp }}/custom.keystore" >> "$GITHUB_ENV"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            if [ "$PUBLISH" = "true" ]; then
+              echo "::error::Publishing needs signing secrets (SIGNING_KEY or SIGN_KEY, ALIAS, KEY_PASSWORD, KEY_STORE_PASSWORD)."
+              exit 1
+            fi
+            echo "::warning::No signing secrets: FOSS release APK will use the default debug keystore."
+          fi
+
+      - name: Build FOSS release APK
+        env:
+          storePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyAlias: ${{ secrets.ALIAS }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+          SIGNED: ${{ steps.signing.outputs.signed }}
+        run: |
+          chmod +x ./gradlew .github/scripts/*.sh
+          source .github/scripts/ci-step.sh
+          ci_step release-apk "Assemble FOSS release APKs (R8 minify + shrink, no telemetry)" \
+            ./gradlew :app:assembleFoss -Pdist=foss -Penable-updater=false --stacktrace
+
+          mkdir -p out
+          APK=$(find app/build/outputs/apk/foss -name "*arm64-v8a*.apk" | head -n1)
+          [ -n "$APK" ] || APK=$(find app/build/outputs/apk/foss -name "*universal*.apk" | head -n1)
+          [ -n "$APK" ] || APK=$(find app/build/outputs/apk/foss -name "*.apk" | head -n1)
+          if [ -z "$APK" ]; then
+            ci_record release-apk FAIL "FOSS release APK was not produced"
+            ci_record release-apk-verify FAIL "FOSS release APK was not produced"
+          elif [ "$SIGNED" = "true" ]; then
+            cp "$APK" "out/mihon-foss-release-$VN.apk"
+            ci_step release-apk-verify "FOSS release APK: package name + valid signature" \
+              bash .github/scripts/verify-apk.sh "out/mihon-foss-release-$VN.apk"
+          else
+            cp "$APK" "out/mihon-foss-release-DEBUGKEY-$VN.apk"
+            ci_record release-apk-verify NOT_RUN "Signed with default debug keystore (no signing secrets)"
+          fi
+          mkdir -p release-extras
+          find app/build/outputs/mapping -type f -exec cp {} release-extras/ \; 2>/dev/null || true
+
+      - name: Upload release APK
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihon-release-apk-${{ needs.plan.outputs.version_name }}
+          path: out/*.apk
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload release build logs (+ R8 mapping)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-build-logs
+          path: |
+            ci-logs/
+            ci-status/
+            release-extras/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Fail if the release build failed
+        if: ${{ !cancelled() }}
+        run: |
+          FAIL=0
+          for f in ci-status/*.tsv; do
+            IFS=$'\t' read -r id status rc desc < "$f"
+            [ "$status" = "FAIL" ] && { echo "::error::$id - $desc"; FAIL=1; }
+          done
+          exit $FAIL
+
+  # ------------------------------------------------------------------------------------------------
+  # Stage 2: emulator checks (launch, NFC deep-link routing, lifecycle, crash/ANR)
+  device-tests:
+    name: "Stage 2: emulator checks"
+    needs: [plan, verify]
+    if: ${{ !cancelled() && needs.plan.outputs.run_device == 'true' && needs.verify.outputs.apk_built == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      VN: ${{ needs.plan.outputs.version_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-android-build
+
+      - name: Download debug APK
+        uses: actions/download-artifact@v4
+        with:
+          name: mihon-debug-apk-${{ needs.plan.outputs.version_name }}
+          path: apks
+
+      - name: Make scripts executable
+        run: chmod +x ./gradlew .github/scripts/*.sh
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run emulator checks
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash .github/scripts/device-tests.sh apks/mihon-debug-${{ needs.plan.outputs.version_name }}.apk device-out ${{ needs.plan.outputs.cycles }}
+
+      - name: Upload instrumented test reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: instrumented-test-reports
+          path: |
+            **/build/reports/androidTests/**
+            **/build/outputs/androidTest-results/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload logcat
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-logcat
+          path: |
+            device-out/mihon-logcat.txt
+            device-out/logcat-crash.txt
+            device-out/final-screen.png
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload device test logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-test-logs
+          path: |
+            device-out/ci-logs/
+            device-out/ci-status/
+            device-out/*.txt
+            !device-out/mihon-logcat.txt
+            !device-out/logcat-crash.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce emulator checks
+        if: ${{ !cancelled() }}
+        run: |
+          FAIL=0
+          for f in device-out/ci-status/*.tsv; do
+            [ -e "$f" ] || { echo "::error::no emulator results were recorded"; exit 1; }
+            IFS=$'\t' read -r id status rc desc < "$f"
+            [ "$status" = "FAIL" ] && { echo "::error title=Emulator check failed::$id - $desc"; FAIL=1; }
+          done
+          exit $FAIL
+
+  # ------------------------------------------------------------------------------------------------
+  report:
+    name: QA + failure report
+    needs: [plan, verify, build-release, device-tests]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Build reports
+        env:
+          VERSION_NAME: ${{ needs.plan.outputs.version_name }}
+          STRICT_LINT: ${{ needs.plan.outputs.strict_lint }}
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 .github/scripts/qa_report.py artifacts report-out
+          mkdir -p qa-report failure-report
+          cp report-out/qa-report.md qa-report/
+          cp report-out/failure-report.md failure-report/
+          { cat report-out/qa-report.md; echo; echo '---'; echo; cat report-out/failure-report.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload QA report
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-report
+          path: qa-report/
+          retention-days: 90
+
+      - name: Upload failure report
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-report
+          path: failure-report/
+          retention-days: 90
+
+  # ------------------------------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: [plan, verify, build-release, device-tests, report]
+    if: >-
+      ${{ !cancelled()
+          && needs.plan.outputs.publish == 'true'
+          && needs.verify.result == 'success'
+          && needs.build-release.result == 'success'
+          && (needs.device-tests.result == 'success' || needs.device-tests.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download APKs and QA report
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '{mihon-debug-apk-*,mihon-release-apk-*,qa-report}'
+          merge-multiple: true
+          path: release-files
+
+      - name: Write release notes
+        env:
+          VN: ${{ needs.plan.outputs.version_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          {
+            echo "Mihon custom build **$VN** (Colorizer + NFC tags) from \`${SHA::7}\`."
+            echo
+            echo "> Built and tested by CI. Physical NFC tag writes and colorizer server tests need on-device verification - see the attached qa-report.md."
+            echo
+            sed -n '/^## Release-readiness gates/,/^Release rule/p' release-files/qa-report.md | sed '$d'
+          } > release-notes.md
+          ls -la release-files
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.plan.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Mihon ${{ needs.plan.outputs.version_name }} (custom + NFC)
+          body_path: release-notes.md
+          generate_release_notes: true
+          prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            release-files/*.apk
+            release-files/qa-report.md

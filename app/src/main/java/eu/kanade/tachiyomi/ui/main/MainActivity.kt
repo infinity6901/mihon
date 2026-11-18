@@ -81,6 +81,7 @@ import eu.kanade.presentation.more.settings.screen.data.RestoreBackupScreen
 import eu.kanade.presentation.util.AssistContentScreen
 import eu.kanade.presentation.util.DefaultNavigatorScreenTransition
 import eu.kanade.tachiyomi.data.download.DownloadCache
+import eu.kanade.tachiyomi.data.nfc.NfcIntentHandler
 import eu.kanade.tachiyomi.data.notification.NotificationReceiver
 import eu.kanade.tachiyomi.extension.ExtensionManager
 import eu.kanade.tachiyomi.ui.base.activity.BaseActivity
@@ -155,6 +156,8 @@ class MainActivity : BaseActivity() {
     @Inject private lateinit var getIncognitoState: GetIncognitoState
 
     @Inject private lateinit var extensionManager: ExtensionManager
+
+    @Inject private lateinit var nfcIntentHandler: NfcIntentHandler
 
     // To be checked by splash screen. If true then splash screen will be removed.
     var ready = false
@@ -241,11 +244,13 @@ class MainActivity : BaseActivity() {
                     this@MainActivity.navigator = navigator
 
                     if (isLaunch) {
+                        // Reset Incognito Mode on relaunch unless launched via an NFC incognito tag
+                        if (!nfcIntentHandler.isIncognitoLaunchIntent(intent)) {
+                            preferences.incognitoMode.set(false)
+                        }
+
                         // Set start screen
                         handleIntentAction(intent, navigator)
-
-                        // Reset Incognito Mode on relaunch
-                        preferences.incognitoMode.set(false)
                     }
                 }
                 LaunchedEffect(navigator.lastItem) {
@@ -594,6 +599,11 @@ class MainActivity : BaseActivity() {
                 notificationId,
                 intent.getIntExtra("groupId", 0),
             )
+        }
+
+        if (nfcIntentHandler.handleIntent(this, intent, navigator, lifecycleScope)) {
+            ready = true
+            return true
         }
 
         val tabToOpen = when (intent.action) {

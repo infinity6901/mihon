@@ -1,0 +1,70 @@
+name: Build custom Mihon
+
+# Lives only on your `custom` branch: <your-fork>/.github/workflows/build-custom.yml
+# Run it from the Actions tab ("Run workflow"), or it runs on every push to `custom`.
+on:
+  workflow_dispatch:
+  push:
+    branches: [custom]
+
+# Makes app/build.gradle.kts read the signing details from the env vars below
+env:
+  MIHON_GITHUB_RELEASE: true
+
+permissions:
+  contents: write # needed to publish the APK as a GitHub Release
+
+concurrency:
+  group: build-custom
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and publish APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version-file: .github/.java-version
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+        with:
+          cache-disabled: true
+
+      - name: Decode signing keystore
+        run: echo "$SIGNING_KEY" | base64 -d > "${{ runner.temp }}/custom.keystore"
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+
+      # FOSS variant = no telemetry, installs next to the official app (app.mihon.foss),
+      # and the update checker is switched off so it never offers you the official APK.
+      - name: Build
+        run: ./gradlew assembleFoss -Pdist=foss -Penable-updater=false
+        env:
+          storeFile: ${{ runner.temp }}/custom.keystore
+          storePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyAlias: ${{ secrets.ALIAS }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Rename APK
+        run: |
+          set -e
+          VERSION=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          mv app/build/outputs/apk/foss/app-universal-foss.apk "mihon-custom-v${VERSION}-r${{ github.run_number }}.apk"
+          echo "APK_NAME=mihon-custom-v${VERSION}-r${{ github.run_number }}.apk" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Publish release
+        run: |
+          gh release create "custom-v${VERSION}-r${{ github.run_number }}" "$APK_NAME" \
+            --title "Mihon ${VERSION} (custom r${{ github.run_number }})" \
+            --notes "Official Mihon ${VERSION} + delete-on-stop patch."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

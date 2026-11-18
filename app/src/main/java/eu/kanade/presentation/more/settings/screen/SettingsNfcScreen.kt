@@ -193,7 +193,7 @@ object SettingsNfcScreen : SearchableSettings {
                     Preference.PreferenceItem.TextPreference(
                         title = stringResource(MR.strings.nfc_sync_category),
                         subtitle = stringResource(MR.strings.nfc_sync_category_summary),
-                        enabled = categories.any { !it.isSystemCategory },
+                        visible = categories.any { !it.isSystemCategory },
                         onClick = { showCategoryPicker = true },
                     ),
                 ),
@@ -214,7 +214,7 @@ object SettingsNfcScreen : SearchableSettings {
                     ),
                     Preference.PreferenceItem.TextPreference(
                         title = stringResource(MR.strings.nfc_clear_unlock_key),
-                        enabled = unlockTagHash.isNotBlank(),
+                        visible = unlockTagHash.isNotBlank(),
                         onClick = { securityPreferences.nfcUnlockTagHash.delete() },
                     ),
                 ),
